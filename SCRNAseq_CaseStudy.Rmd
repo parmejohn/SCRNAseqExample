@@ -1,0 +1,332 @@
+---
+title: "SCRNAseq_CaseStudy"
+author: "John Pham"
+date: "21/07/2023"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='../plot/', dev = 'png', 
+                      echo=TRUE, warning=FALSE, message=FALSE)
+
+### insert own working direc and plot output folder here
+knitr::opts_knit$set(root.dir = '~/Desktop/project/SCRNAseqExample/')
+plotpdf <- "plots/"
+set.seed(1)
+```
+
+## Libraries
+```{r lib, message=F, warning=F}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("celldex")
+# BiocManager::install("SingleCellExperiment")
+# BiocManager::install("SingleR")
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tibble)
+library(tidyverse)
+library(Seurat)
+library(SeuratObject)
+library(pheatmap)
+library(celldex)
+library(SingleCellExperiment)
+library(SingleR)
+
+### use this line to install DoubletFinder if needed
+#remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", upgrade = F)
+suppressMessages(require(DoubletFinder))
+```
+
+## Functions
+``` {r fxns}
+seurat_processing <- function(seurat_obj, regress){
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  if (regress == TRUE){
+      seurat_obj <- ScaleData(seurat_obj, vars.to.regress = c("CC.Difference", "percent.mt"))
+  } else {
+    seurat_obj <- ScaleData(seurat_obj)
+  }
+}
+
+plot_density_log10 <- function(df, feature, xintercept, xlabel, title){
+   ggplot(data = df, aes(x=.data[[feature]])) + 
+  	   geom_density(alpha = 0.2) + 
+  	   scale_x_log10() + 
+  	   theme_classic() +
+       xlab(xlabel) +
+  	   ylab("Cell density") +
+  	   geom_vline(xintercept = xintercept) + 
+       ggtitle(title)
+}
+
+print_and_save <- function(plot, title){
+  print(plot)
+  pdf(paste(plotpdf, title,sep=""),width = 8, height = 6)
+  print(plot)
+  dev.off()
+}
+```
+
+## Seurat processing for scData
+```{r Pre-processing count data, warning=F, message=FALSE, cache=T, echo = T, results = 'hide'}
+raw_counts <- read.table(file="data/case_study_raw_counts.tsv.gz",sep="\t", header = T)
+raw_counts <- column_to_rownames(raw_counts, "barcode")
+raw_counts <- t(raw_counts)
+
+seurat_data <- CreateSeuratObject(counts = raw_counts, project = "CaseStudy_Seurat")
+
+### find number of mitochondrial genes
+mito.genes <- grep(pattern = "^MT", x = seurat_data@assays[["RNA"]]@data@Dimnames[[1]], value = T)
+
+seurat_data.edited <- seurat_processing(seurat_data, F)
+seurat_data.edited[["percent.mt"]] <- PercentageFeatureSet(seurat_data, features = mito.genes)
+
+### UMI count summary over all barcoded cells
+summary(seurat_data.edited$nCount_RNA)
+
+### median gene count
+summary(seurat_data.edited$nFeature_RNA)
+
+### identifying doublets using DoubletFinder
+seurat_data.edited <- RunPCA(seurat_data.edited, features = VariableFeatures(object = seurat_data.edited))
+predoublet_elbow <- ElbowPlot(seurat_data.edited) + ggtitle("Elbow Plot Pre-doublet removal") # determines 5 is a sharp cutoff for prefiltered data
+print_and_save(predoublet_elbow, "predoublet_elbow.pdf")
+
+seurat_data.edited <- RunUMAP(seurat_data.edited, dims = 1:5)
+
+### lines 106-108 were used to find the optimal pK value
+# seurat_data.edited.sweep <- paramSweep_v3(seurat_data.edited, PCs = 1:5, sct = FALSE)
+# seurat_data.edited.sweep.summ <- summarizeSweep(seurat_data.edited.sweep, GT = FALSE)
+# seurat_data.edited.pk <- find.pK(seurat_data.edited.sweep.summ)
+optimal_pK <- 0.29 # as.numeric(as.character(droplevels(seurat_data.edited.pk[which.max(seurat_data.edited.pk$BCmetric), 2])))
+nExp <- round(ncol(seurat_data.edited) * 0.032) # assuming 3.2% multiplet rate in accordance to 10x genomics standards
+seurat_data.doub <- doubletFinder_v3(seurat_data.edited, pN = 0.25, pK = optimal_pK, nExp = nExp, PCs = 1:5)
+
+doublet.count <- grep(pattern = "Doublet", x = seurat_data.doub@meta.data[[paste("DF.classifications_0.25_", toString(optimal_pK),"_127", sep = "")]])
+
+### set up cell-cycle scoring
+cc <- cc.genes.updated.2019
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+seurat_data.doub.cc <- CellCycleScoring(seurat_data.doub, s.features = s.genes, g2m.features = g2m.genes)
+seurat_data.doub.cc$CC.Difference <- seurat_data.doub.cc$S.Score - seurat_data.doub.cc$G2M.Score
+```
+
+## QC
+```{r qc_plots, warning=F, message=FALSE, echo = T, results = 'hide'}
+### non-qc
+overall_qc <- VlnPlot(seurat_data.doub.cc, features = c("nFeature_RNA","nCount_RNA","percent.mt"),pt.size = 0.1) & 
+  theme(plot.title = element_text(size=10), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank())
+print_and_save(overall_qc, "overall_qc.pdf")
+
+# majority of cells have under ~500 UMI counts; low quality, needs to be sequenced more deeply
+prefilt_nCountRNA_density <- plot_density_log10(seurat_data.doub.cc@meta.data, "nCount_RNA", 
+                                                500, "log10(UMI Count per cell)", "Density Plot for Pre-filtered UMI counts per cell")
+print_and_save(prefilt_nCountRNA_density, "prefilt_nCountRNA_density.pdf")
+
+# majority of cells also express < 200 genes; low quality
+prefilt_nFeatureRNA_density <- plot_density_log10(seurat_data.doub.cc@meta.data, "nFeature_RNA", 
+                                                  200 , "log10(Genes per cell)", "Density Plot for Pre-filtered Genes per cell")
+print_and_save(prefilt_nFeatureRNA_density, "prefilt_nFeatureRNA_density.pdf")
+
+median_gene_qc <- VlnPlot(seurat_data.doub.cc, features = "nFeature_RNA", pt.size = 0.1) + 
+  geom_boxplot() & 
+  theme(plot.title = element_text(size=10), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        legend.position = "none")
+print_and_save(median_gene_qc, "median_gene_qc.pdf")
+
+# majority of cell counts belong to non-mitochondrial genes
+prefilt_mt_density <- seurat_data.doub.cc@meta.data %>% 
+  	ggplot(aes(x=percent.mt)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+    xlab("Mitochondrial genes percentage") +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 35) +
+    ggtitle("Density Plot for Pre-filtered Mitochondrial Genes Percentage")
+print_and_save(prefilt_mt_density, "prefilt_mt_density.pdf")
+
+### Filter out genes based on thresholds; Very large majority of cells were removed
+seurat_data.filtered <- subset(seurat_data.doub.cc, subset = nCount_RNA >= 500 & nFeature_RNA >= 200 & percent.mt <= 30 & 
+   DF.classifications_0.25_0.29_127 == 'Singlet')
+
+### post filter plots
+post_qc <- VlnPlot(seurat_data.filtered, features = c("nFeature_RNA","nCount_RNA","percent.mt"),ncol = 4,pt.size = 0.1) & 
+  theme(plot.title = element_text(size=10), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank())
+print_and_save(post_qc, "post_qc.pdf")
+
+postfilt_nCountRNA_density <- plot_density_log10(seurat_data.filtered@meta.data, "nCount_RNA", 500, 
+                                                 "log10(UMI Count per cell)", " Density Plot for Filtered UMI counts per cell")
+print_and_save(postfilt_nCountRNA_density, "postfilt_nCountRNA_density.pdf")
+
+postfilt_nFeatureRNA_density <- plot_density_log10(seurat_data.filtered@meta.data, "nFeature_RNA", 200, 
+                                                   "log10(Genes per cell)", "Density Plot for Filtered Genes per cell")
+print_and_save(postfilt_nFeatureRNA_density, "postfilt_nFeatureRNA_density.pdf")
+
+summary(seurat_data.filtered$nFeature_RNA)
+median_gene_postqc <- VlnPlot(seurat_data.filtered, features = "nFeature_RNA", pt.size = 0.1) + geom_boxplot() & 
+  theme(plot.title = element_text(size=10), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        legend.position = "none")
+print_and_save(median_gene_postqc, "median_gene_postqc.pdf")
+
+postfilt_mt_density <- seurat_data.filtered@meta.data %>% 
+  	ggplot(aes(x=percent.mt)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 35) +
+    ggtitle("Density Plot for Filtered Mitochondrial Genes Percentage")
+print_and_save(postfilt_mt_density, "postfilt_mt_density.pdf")
+```
+
+## Perform clustering of removed cells
+```{r processing, warning=F, message=FALSE, echo = T, results = 'hide'}
+#seurat_data.final <- seurat_processing(seurat_data.filtered, T)
+seurat_data.final <- SCTransform(seurat_data.filtered, vars.to.regress = c("percent.mt", "CC.Difference"))
+
+seurat_data.final <- RunPCA(seurat_data.final, features = VariableFeatures(object = seurat_data.final))
+final_elbowplot <- ElbowPlot(seurat_data.final) + ggtitle("Elbow Plot for SCTransformed data") #4 seems the most optimal
+print_and_save(final_elbowplot, "final_elbowplot.pdf")
+
+seurat_data.final <- RunUMAP(seurat_data.final, dims = 1:4)
+
+DefaultAssay(seurat_data.final) <- "SCT"
+
+seurat_data.final <- FindNeighbors(seurat_data.final, dims = 1:4, verbose = FALSE)
+seurat_data.final <- FindClusters(seurat_data.final, verbose = FALSE, resolution = 0.8)
+
+# final clustering with filtering and regression
+seurat_data.final <- SetIdent(seurat_data.final, value = "seurat_clusters")
+
+# without cell labels
+DimPlot(seurat_data.final, label = TRUE) + NoLegend()
+```
+
+## Identify cell markers
+```{r cell_markers, warning=F, message=FALSE, cache=T, echo = T, results = 'hide'}
+# perform on the RNA assay as recommended from Seurat authors
+#DefaultAssay(seurat_data.final) <- "SCT"
+
+### recommended way from singlecellcourse
+DefaultAssay(seurat_data.final) <- "RNA"
+seurat_data.final <- NormalizeData(seurat_data.final)
+seurat_data.final <- FindVariableFeatures(seurat_data.final, selection.method = "vst", nfeatures = 2000)
+all.genes <- rownames(seurat_data.final)
+seurat_data.final <- ScaleData(seurat_data.final, features = all.genes, vars.to.regress = c("CC.Difference", "percent.mt"))
+
+### automated cell marker identification through SingleR
+# also manually confirm by checking literature
+hpca.ref <- celldex::HumanPrimaryCellAtlasData()
+sce <- as.SingleCellExperiment(DietSeurat(seurat_data.final))
+
+hpca.main <- SingleR(test = sce,assay.type.test = 1,ref = hpca.ref,labels = hpca.ref$label.main)
+hpca.fine <- SingleR(test = sce,assay.type.test = 1,ref = hpca.ref,labels = hpca.ref$label.fine)
+
+table(hpca.main$pruned.labels)
+table(hpca.fine$pruned.labels)
+
+seurat_data.final@meta.data$hpca.main <- hpca.main$pruned.labels
+seurat_data.final@meta.data$hpca.fine <- hpca.fine$pruned.labels
+
+DefaultAssay(seurat_data.final) <- "SCT" # set back to main UMAP from RNA assay
+list_clusters <- list()
+
+### view table to determine majority of cell types for given cluster
+for (i in 0:4){
+   temp <- subset(seurat_data.final@meta.data, seurat_clusters == i)
+   temp <- table(temp$hpca.main)
+   list_clusters[[i+1]] <- temp
+}
+
+seurat_data.final.labeled <- RenameIdents(seurat_data.final, `0` = "Neutrophils", `1` = "Neutrophils", `2` = "Neutrophils",
+    `3` = "T-cells", `4` = "B-Cells")
+final_umap <- DimPlot(seurat_data.final.labeled, label = T , repel = T, label.size = 3) + ggtitle("UMAP of Single-cell Case Study")
+print_and_save(final_umap, "final_umap.pdf")
+```
+
+## Questions and answers
+### 1. Find the mitochondrial count
+There are 127 mitochondrial genes.
+```{r, warning=F, message=FALSE}
+length(mito.genes)
+```
+
+### 2. Identify the doublets and remove/refine them
+There are 127 doublets that were removed from prior to the final UMAP.
+```{r, warning=F, message=FALSE}
+length(doublet.count)
+```
+
+### 3. Find the median gene count
+Before filtering the median gene count was 8.
+```{r, warning=F, message=FALSE, class.source = "fold-show"}
+summary(seurat_data.edited$nFeature_RNA)
+print(median_gene_qc)
+```
+
+Post-filtering shows that the median gene count was 644.
+```{r, warning=F, message=FALSE, class.source = "fold-show"}
+summary(seurat_data.filtered$nFeature_RNA)
+print(median_gene_postqc)
+```
+
+### 4. Find the UMI count
+Pre-filtering UMI count (nCount_RNA)
+```{r, warning=F, message=FALSE, class.source = "fold-show"}
+summary(seurat_data.edited$nCount_RNA)
+print(overall_qc)
+```
+
+Post-filtered data UMI count
+```{r, warning=F, message=FALSE, class.source = "fold-show"}
+summary(seurat_data.filtered$nCount_RNA)
+print(post_qc)
+```
+
+### 5. How do you normalize this data?
+Initially, for finding doublets I used the NormalizeData function from Seurat which performs log-normalization by default. I also performed this normalization downstream when identifying cell-markers as it was recommended by the Seurat authors.
+
+For the final clustering, I used SCTransform from Seurat, which uses a regularized negative binomial model to normalize the UMI counts. This was said to find rarer cell populations from improved signal-to-noise ratio.
+
+### 6. Can you do a dimension reduction? Like PCA? If yes, what do you think are the optimal number of PCs that can be used to describe this data?
+Yes, I performed PCA through Seurat's RunPCA function. For both pre- and post-filtered data the optimal number of PCs was determined by using an Elbow plot (visualizes the standard deviation of each PC).
+```{r, warning=F, message=FALSE}
+print(predoublet_elbow)
+print(final_elbowplot)
+```
+
+### 7. Can you do a simple unsupervised clustering on this data? If yes, what is the best way to display the clusters? Also, how do you think we can identify the optimal number of clusters?
+Yes, I used a UMAP for this data since it will represent the clusters by similarity and therefore by celltypes. The optimal number of clusters will be based on the optimal number of PCs used in the PCA and through the resolution chosen in the FindClusters function in Seurat.
+```{r, warning=F, message=FALSE}
+print(final_umap)
+```
+
+### 8. Is it possible to identify subpopulations in this data? Like can you identify some broad celltypes? If yes, can you provide that information?
+Yes, it is possible to find subpopulations from this data. From using known cell-markers from the HumanPrimaryCellAtlasData, I used SingleR which is an automated method to categorize each cell type. I then labeled it accordingly to the UMAP clustering. There were 3 broad celltypes in this dataset, which are T-cells, B-cells, and Neutrophils
+```{r, warning=F, message=FALSE}
+print(final_umap)
+```
+
+### 9. Can you provide some metrics to show the overall quality of this data ?
+I found that the overall quality of this data was quite low due to the number of genes and UMIs per cell falling below common thresholds. As seen from the density plots below, a majority of cells had too few genes and UMIs per cell.
+```{r, warning=F, message=FALSE}
+print(prefilt_nCountRNA_density)
+print(prefilt_nFeatureRNA_density)
+```

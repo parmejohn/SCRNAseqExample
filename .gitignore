@@ -1,0 +1,5 @@
+SCRNAseq_CaseStudy_cache/
+*.log
+*.tex
+.Rhistory
+.git/
